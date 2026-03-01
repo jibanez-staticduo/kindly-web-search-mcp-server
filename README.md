@@ -15,6 +15,8 @@ Works with **Claude Code**, **Codex**, **Antigravity**, **Cursor**, **Windsurf**
 
 If you like what we're building, please ⭐ **star this repo** – it's a huge motivation for us to keep going!
 
+## Kindly
+
 ![Kindly Web Search](assets/kindly_header.png)
 
 ## Why do we need another web search MCP server?
