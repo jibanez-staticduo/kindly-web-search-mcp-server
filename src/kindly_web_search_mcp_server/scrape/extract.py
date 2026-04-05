@@ -79,7 +79,7 @@ def extract_content_as_markdown(html: str) -> str:
         result = trafilatura.extract(
             html,
             output_format="markdown",
-            include_links=False,
+            include_links=True,
             include_images=False,
             include_tables=True,
         )
