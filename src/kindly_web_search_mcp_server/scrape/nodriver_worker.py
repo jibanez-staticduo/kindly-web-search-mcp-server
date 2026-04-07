@@ -883,14 +883,18 @@ async def _fetch_html(
     async def _cleanup(stop_browser: bool) -> None:
         nonlocal chrome_proc, browser
         try:
-            for maybe_page in (page, ref_page):
-                if maybe_page is None:
-                    continue
-                closer = getattr(maybe_page, "close", None)
-                if callable(closer):
-                    maybe = closer()
-                    if asyncio.iscoroutine(maybe):
-                        await maybe
+            # When reusing a pooled browser, keep the page target alive for the next
+            # request. Closing the reused page leaves the slot with no page target and
+            # later create_target() calls can fail intermittently under repeated use.
+            if not reuse_requested:
+                for maybe_page in (page, ref_page):
+                    if maybe_page is None:
+                        continue
+                    closer = getattr(maybe_page, "close", None)
+                    if callable(closer):
+                        maybe = closer()
+                        if asyncio.iscoroutine(maybe):
+                            await maybe
 
             if browser is not None and stop_browser:
                 stopper = getattr(browser, "stop", None)

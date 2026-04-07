@@ -9,6 +9,7 @@ import time
 from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from .models import GetContentResponse, WebSearchResponse
 from .content.resolver import resolve_page_content_markdown
@@ -32,6 +33,9 @@ mcp = FastMCP(
         "Web search via Serper (default), Tavily, or a self-hosted SearXNG instance with best-effort "
         "scraping/extraction of result pages into Markdown for LLM consumption."
     ),
+    # LiteLLM reaches this server over the Docker network, so localhost-only DNS
+    # rebinding protection blocks tool discovery and prevents wrapper generation.
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
 
 Transport = Literal["stdio", "sse", "streamable-http"]
@@ -99,7 +103,9 @@ def _resolve_transport(raw: str | None) -> Transport:
 
 def _resolve_host_port(host: str | None, port: int | None) -> tuple[str, int]:
     resolved_host = host or os.environ.get("FASTMCP_HOST", "127.0.0.1")
-    resolved_port_raw = str(port) if port is not None else os.environ.get("FASTMCP_PORT", "8000")
+    resolved_port_raw = (
+        str(port) if port is not None else os.environ.get("FASTMCP_PORT", "8000")
+    )
     try:
         resolved_port = int(resolved_port_raw)
     except ValueError:
@@ -124,7 +130,8 @@ def main(argv: list[str] | None = None) -> None:
     if (
         transport == "stdio"
         and sys.stdin.isatty()
-        and os.environ.get("MCP_ALLOW_TTY_STDIO", "").strip().lower() not in ("1", "true", "yes")
+        and os.environ.get("MCP_ALLOW_TTY_STDIO", "").strip().lower()
+        not in ("1", "true", "yes")
     ):
         print(
             "Error: `--stdio` transport is intended to be launched by an MCP client (stdin/stdout JSON-RPC).",
@@ -160,14 +167,21 @@ def main(argv: list[str] | None = None) -> None:
         for key, value in (("host", host), ("port", port)):
             if hasattr(mcp, "settings") and hasattr(mcp.settings, key):
                 setattr(mcp.settings, key, value)
+        # FastMCP auto-enables localhost-only host validation because the server
+        # object is created before CLI args are parsed. In Docker we bind to
+        # 0.0.0.0 and LiteLLM connects via the container hostname, so we must
+        # disable the stale localhost-only restriction after resolving runtime
+        # host/port.
+        if hasattr(mcp, "settings") and hasattr(mcp.settings, "transport_security"):
+            mcp.settings.transport_security = TransportSecuritySettings(
+                enable_dns_rebinding_protection=False
+            )
 
     try:
         mcp.run(transport=transport, mount_path=args.mount_path)
     except TypeError:
         # Backward-compat: older MCP SDKs may not accept `mount_path`.
         mcp.run(transport=transport)
-
-
 
 
 def _get_int_env(key: str, default: int) -> int:
@@ -222,6 +236,7 @@ def _resolve_web_search_max_concurrency(num_results: int) -> int:
 def _timeout_markdown_note(url: str, *, scope: str | None = None) -> str:
     detail = f": {scope}" if scope else ""
     return f"_Failed to retrieve page content: TimeoutError{detail}_\n\nSource: {url}\n"
+
 
 @mcp.tool()
 async def web_search(
@@ -278,11 +293,15 @@ async def web_search(
             "TAVILY_API_KEY": os.environ.get("TAVILY_API_KEY", ""),
             "SEARXNG_BASE_URL": os.environ.get("SEARXNG_BASE_URL", ""),
             "GITHUB_TOKEN": os.environ.get("GITHUB_TOKEN", ""),
-            "KINDLY_TOOL_TOTAL_TIMEOUT_SECONDS": os.environ.get("KINDLY_TOOL_TOTAL_TIMEOUT_SECONDS", ""),
+            "KINDLY_TOOL_TOTAL_TIMEOUT_SECONDS": os.environ.get(
+                "KINDLY_TOOL_TOTAL_TIMEOUT_SECONDS", ""
+            ),
             "KINDLY_TOOL_TOTAL_TIMEOUT_MAX_SECONDS": os.environ.get(
                 "KINDLY_TOOL_TOTAL_TIMEOUT_MAX_SECONDS", ""
             ),
-            "KINDLY_WEB_SEARCH_MAX_CONCURRENCY": os.environ.get("KINDLY_WEB_SEARCH_MAX_CONCURRENCY", ""),
+            "KINDLY_WEB_SEARCH_MAX_CONCURRENCY": os.environ.get(
+                "KINDLY_WEB_SEARCH_MAX_CONCURRENCY", ""
+            ),
         }
         parent_diag.emit(
             "web_search.start",
@@ -334,9 +353,7 @@ async def web_search(
             else:
                 try:
                     page_md = await asyncio.wait_for(
-                        resolve_page_content_markdown(
-                            r.link, diagnostics=result_diag
-                        ),
+                        resolve_page_content_markdown(r.link, diagnostics=result_diag),
                         timeout=remaining,
                     )
                 except asyncio.TimeoutError:
@@ -352,10 +369,12 @@ async def web_search(
                     detail = full_detail
                     if len(detail) > 200:
                         detail = detail[:200].rstrip() + "…"
-                    suffix = f": {type(exc).__name__}: {detail}" if detail else f": {type(exc).__name__}"
-                    page_md = (
-                        f"_Failed to retrieve page content{suffix}_\n\nSource: {r.link}\n"
+                    suffix = (
+                        f": {type(exc).__name__}: {detail}"
+                        if detail
+                        else f": {type(exc).__name__}"
                     )
+                    page_md = f"_Failed to retrieve page content{suffix}_\n\nSource: {r.link}\n"
                     if result_diag:
                         result_diag.emit(
                             "content.error",
@@ -435,11 +454,15 @@ async def get_content(url: str) -> dict:
     diag = Diagnostics(request_id, diag_enabled, stream=sys.stderr)
     if diag_enabled:
         env_snapshot = {
-            "KINDLY_TOOL_TOTAL_TIMEOUT_SECONDS": os.environ.get("KINDLY_TOOL_TOTAL_TIMEOUT_SECONDS", ""),
+            "KINDLY_TOOL_TOTAL_TIMEOUT_SECONDS": os.environ.get(
+                "KINDLY_TOOL_TOTAL_TIMEOUT_SECONDS", ""
+            ),
             "KINDLY_TOOL_TOTAL_TIMEOUT_MAX_SECONDS": os.environ.get(
                 "KINDLY_TOOL_TOTAL_TIMEOUT_MAX_SECONDS", ""
             ),
-            "KINDLY_BROWSER_EXECUTABLE_PATH": os.environ.get("KINDLY_BROWSER_EXECUTABLE_PATH", ""),
+            "KINDLY_BROWSER_EXECUTABLE_PATH": os.environ.get(
+                "KINDLY_BROWSER_EXECUTABLE_PATH", ""
+            ),
         }
         diag.emit(
             "get_content.start",
@@ -449,7 +472,8 @@ async def get_content(url: str) -> dict:
 
     try:
         page_md = await asyncio.wait_for(
-            resolve_page_content_markdown(url, diagnostics=diag), timeout=timeout_seconds
+            resolve_page_content_markdown(url, diagnostics=diag),
+            timeout=timeout_seconds,
         )
     except asyncio.TimeoutError:
         page_md = _timeout_markdown_note(url, scope="tool time budget exceeded")
@@ -464,13 +488,19 @@ async def get_content(url: str) -> dict:
         detail = full_detail
         if len(detail) > 200:
             detail = detail[:200].rstrip() + "…"
-        suffix = f": {type(exc).__name__}: {detail}" if detail else f": {type(exc).__name__}"
+        suffix = (
+            f": {type(exc).__name__}: {detail}" if detail else f": {type(exc).__name__}"
+        )
         page_md = f"_Failed to retrieve page content{suffix}_\n\nSource: {url}\n"
         if diag_enabled:
             diag.emit(
                 "content.error",
                 "Content fetch failed",
-                {"error": type(exc).__name__, "detail": full_detail, "detail_len": len(full_detail)},
+                {
+                    "error": type(exc).__name__,
+                    "detail": full_detail,
+                    "detail_len": len(full_detail),
+                },
             )
 
     if page_md is None:
@@ -481,7 +511,9 @@ async def get_content(url: str) -> dict:
             f"\n\nSource: {url}\n"
         )
         if diag_enabled:
-            diag.emit("content.skip", "Content fetch skipped", {"reason": "probable PDF"})
+            diag.emit(
+                "content.skip", "Content fetch skipped", {"reason": "probable PDF"}
+            )
 
     if diag_enabled:
         diag.emit(

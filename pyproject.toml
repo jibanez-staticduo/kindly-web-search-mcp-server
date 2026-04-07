@@ -7,7 +7,7 @@ name = "kindly-web-search-mcp-server"
 version = "0.1.8"
 description = "MCP server: Serper web search + robust content retrieval."
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 dependencies = [
     "mcp",
     "pydantic",
