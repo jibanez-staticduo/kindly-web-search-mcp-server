@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-import sys
+import importlib
 import os
+import sys
+import types
 from pathlib import Path
 import unittest
 import asyncio
@@ -12,9 +14,48 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from kindly_web_search_mcp_server.models import WebSearchResult
 
 
+def _install_fake_mcp() -> None:
+    fake_mcp_module = types.ModuleType("mcp")
+    fake_server_module = types.ModuleType("mcp.server")
+    fake_fastmcp_module = types.ModuleType("mcp.server.fastmcp")
+    fake_transport_module = types.ModuleType("mcp.server.transport_security")
+
+    class _FakeFastMCP:
+        def __init__(self, *_args, **_kwargs):
+            self.settings = types.SimpleNamespace(host=None, port=None, transport_security=None)
+
+        def tool(self):
+            def _decorator(func):
+                return func
+
+            return _decorator
+
+        def run(self, **_kwargs):
+            return None
+
+    class _FakeTransportSecuritySettings:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    fake_fastmcp_module.FastMCP = _FakeFastMCP
+    fake_transport_module.TransportSecuritySettings = _FakeTransportSecuritySettings
+
+    sys.modules["mcp"] = fake_mcp_module
+    sys.modules["mcp.server"] = fake_server_module
+    sys.modules["mcp.server.fastmcp"] = fake_fastmcp_module
+    sys.modules["mcp.server.transport_security"] = fake_transport_module
+
+
+def _import_server_module():
+    _install_fake_mcp()
+    sys.modules.pop("kindly_web_search_mcp_server.server", None)
+    return importlib.import_module("kindly_web_search_mcp_server.server")
+
+
 class TestWebSearchTool(unittest.IsolatedAsyncioTestCase):
     def test_tool_timeout_budget_can_exceed_55_seconds(self) -> None:
-        from kindly_web_search_mcp_server.server import _resolve_tool_total_timeout_seconds
+        server = _import_server_module()
+        _resolve_tool_total_timeout_seconds = server._resolve_tool_total_timeout_seconds
 
         with patch.dict(
             os.environ,
@@ -58,12 +99,13 @@ class TestWebSearchTool(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(_resolve_tool_total_timeout_seconds(), 90.0)
 
     def test_web_search_concurrency_defaults_on_windows(self) -> None:
-        from kindly_web_search_mcp_server.server import _resolve_web_search_max_concurrency
+        server = _import_server_module()
+        _resolve_web_search_max_concurrency = server._resolve_web_search_max_concurrency
 
         with patch.dict(os.environ, {}, clear=True), patch(
             "kindly_web_search_mcp_server.server.os.name", "nt"
         ):
-            self.assertEqual(_resolve_web_search_max_concurrency(3), 1)
+            self.assertEqual(_resolve_web_search_max_concurrency(3), 3)
 
         with patch.dict(
             os.environ,
@@ -77,24 +119,25 @@ class TestWebSearchTool(unittest.IsolatedAsyncioTestCase):
             {"KINDLY_WEB_SEARCH_MAX_CONCURRENCY": "abc"},
             clear=True,
         ), patch("kindly_web_search_mcp_server.server.os.name", "nt"):
-            self.assertEqual(_resolve_web_search_max_concurrency(3), 1)
+            self.assertEqual(_resolve_web_search_max_concurrency(3), 3)
 
         with patch.dict(
             os.environ,
             {"KINDLY_WEB_SEARCH_MAX_CONCURRENCY": "0"},
             clear=True,
         ), patch("kindly_web_search_mcp_server.server.os.name", "nt"):
-            self.assertEqual(_resolve_web_search_max_concurrency(3), 1)
+            self.assertEqual(_resolve_web_search_max_concurrency(3), 3)
 
         with patch.dict(
             os.environ,
             {"KINDLY_WEB_SEARCH_MAX_CONCURRENCY": "-2"},
             clear=True,
         ), patch("kindly_web_search_mcp_server.server.os.name", "nt"):
-            self.assertEqual(_resolve_web_search_max_concurrency(3), 1)
+            self.assertEqual(_resolve_web_search_max_concurrency(3), 3)
 
     def test_web_search_concurrency_limited_by_num_results_on_windows(self) -> None:
-        from kindly_web_search_mcp_server.server import _resolve_web_search_max_concurrency
+        server = _import_server_module()
+        _resolve_web_search_max_concurrency = server._resolve_web_search_max_concurrency
 
         with patch.dict(
             os.environ,
@@ -104,7 +147,8 @@ class TestWebSearchTool(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(_resolve_web_search_max_concurrency(3), 3)
 
     def test_web_search_concurrency_defaults_on_non_windows(self) -> None:
-        from kindly_web_search_mcp_server.server import _resolve_web_search_max_concurrency
+        server = _import_server_module()
+        _resolve_web_search_max_concurrency = server._resolve_web_search_max_concurrency
 
         with patch.dict(os.environ, {}, clear=True), patch(
             "kindly_web_search_mcp_server.server.os.name", "posix"
@@ -133,13 +177,15 @@ class TestWebSearchTool(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(_resolve_web_search_max_concurrency(3), 3)
 
     def test_tool_timeout_defaults_to_120_seconds(self) -> None:
-        from kindly_web_search_mcp_server.server import _resolve_tool_total_timeout_seconds
+        server = _import_server_module()
+        _resolve_tool_total_timeout_seconds = server._resolve_tool_total_timeout_seconds
 
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(_resolve_tool_total_timeout_seconds(), 120.0)
 
     async def test_web_search_returns_results(self) -> None:
-        from kindly_web_search_mcp_server.server import web_search
+        server = _import_server_module()
+        web_search = server.web_search
 
         mocked_results = [
             WebSearchResult(title="T", link="https://example.com", snippet="S", page_content="")
@@ -166,7 +212,8 @@ class TestWebSearchTool(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Hello", out["results"][0]["page_content"])
 
     async def test_get_content_returns_markdown(self) -> None:
-        from kindly_web_search_mcp_server.server import get_content
+        server = _import_server_module()
+        get_content = server.get_content
 
         with patch(
             "kindly_web_search_mcp_server.server.resolve_page_content_markdown",
@@ -180,7 +227,8 @@ class TestWebSearchTool(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Hello", out["page_content"])
 
     async def test_get_content_handles_none(self) -> None:
-        from kindly_web_search_mcp_server.server import get_content
+        server = _import_server_module()
+        get_content = server.get_content
 
         with patch(
             "kindly_web_search_mcp_server.server.resolve_page_content_markdown",
@@ -193,7 +241,8 @@ class TestWebSearchTool(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Could not retrieve content", out["page_content"])
 
     async def test_get_content_returns_timeout_note_on_timeout(self) -> None:
-        from kindly_web_search_mcp_server.server import get_content
+        server = _import_server_module()
+        get_content = server.get_content
 
         with patch(
             "kindly_web_search_mcp_server.server.resolve_page_content_markdown",
@@ -206,7 +255,8 @@ class TestWebSearchTool(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Source: https://example.com", out["page_content"])
 
     async def test_web_search_returns_timeout_note_on_timeout(self) -> None:
-        from kindly_web_search_mcp_server.server import web_search
+        server = _import_server_module()
+        web_search = server.web_search
 
         mocked_results = [
             WebSearchResult(

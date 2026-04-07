@@ -883,6 +883,13 @@ async def _fetch_html(
     async def _cleanup(stop_browser: bool) -> None:
         nonlocal chrome_proc, browser
         try:
+            if reuse_requested and page is not None:
+                # Keep the pooled target alive, but reset it to a quiet page so the
+                # previously scraped site cannot keep burning CPU between requests.
+                with contextlib.suppress(Exception):
+                    await _navigate_tab(page, "about:blank")
+                    await asyncio.sleep(0.05)
+
             # When reusing a pooled browser, keep the page target alive for the next
             # request. Closing the reused page leaves the slot with no page target and
             # later create_target() calls can fail intermittently under repeated use.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import types
 from pathlib import Path
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -9,6 +10,36 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 
 class TestUniversalHtmlLoader(unittest.IsolatedAsyncioTestCase):
+    def _fake_proc(self, stdout: bytes, stderr: bytes = b"", returncode: int = 0):
+        class _FakeStream:
+            def __init__(self, payload: bytes):
+                self._payload = payload
+                self._consumed = False
+
+            async def read(self, _n: int = -1) -> bytes:
+                if self._consumed:
+                    return b""
+                self._consumed = True
+                return self._payload
+
+        class _FakeProc:
+            def __init__(self):
+                self.returncode = returncode
+                self.pid = 1234
+                self.stdout = _FakeStream(stdout)
+                self.stderr = _FakeStream(stderr)
+
+            async def wait(self) -> int:
+                return self.returncode
+
+            def terminate(self) -> None:
+                self.returncode = -15
+
+            def kill(self) -> None:
+                self.returncode = -9
+
+        return _FakeProc()
+
     async def test_pdf_url_returns_none(self) -> None:
         from kindly_web_search_mcp_server.scrape.universal_html import load_url_as_markdown
 
@@ -42,17 +73,14 @@ class TestUniversalHtmlLoader(unittest.IsolatedAsyncioTestCase):
     async def test_fetch_html_spawns_worker_subprocess(self) -> None:
         from kindly_web_search_mcp_server.scrape.universal_html import fetch_html_via_nodriver
 
-        class _FakeProc:
-            returncode = 0
-
-            async def communicate(self):
-                return b"<html><body><p>ok</p></body></html>", b"noisy but ignored"
-
         with patch(
             "kindly_web_search_mcp_server.scrape.universal_html.asyncio.create_subprocess_exec",
             new_callable=AsyncMock,
         ) as mock_spawn:
-            mock_spawn.return_value = _FakeProc()
+            mock_spawn.return_value = self._fake_proc(
+                b"<html><body><p>ok</p></body></html>",
+                b"noisy but ignored",
+            )
             html = await fetch_html_via_nodriver("https://example.com")
 
         self.assertIn("ok", html)
@@ -66,17 +94,11 @@ class TestUniversalHtmlLoader(unittest.IsolatedAsyncioTestCase):
     async def test_fetch_html_passes_browser_executable_path_when_set(self) -> None:
         from kindly_web_search_mcp_server.scrape.universal_html import fetch_html_via_nodriver
 
-        class _FakeProc:
-            returncode = 0
-
-            async def communicate(self):
-                return b"<html><body><p>ok</p></body></html>", b""
-
         with patch.dict("os.environ", {"KINDLY_BROWSER_EXECUTABLE_PATH": "/usr/bin/chromium"}), patch(
             "kindly_web_search_mcp_server.scrape.universal_html.asyncio.create_subprocess_exec",
             new_callable=AsyncMock,
         ) as mock_spawn:
-            mock_spawn.return_value = _FakeProc()
+            mock_spawn.return_value = self._fake_proc(b"<html><body><p>ok</p></body></html>")
             await fetch_html_via_nodriver("https://example.com")
 
         args, _kwargs = mock_spawn.call_args
@@ -86,12 +108,6 @@ class TestUniversalHtmlLoader(unittest.IsolatedAsyncioTestCase):
     async def test_fetch_html_sets_no_proxy_for_loopback(self) -> None:
         from kindly_web_search_mcp_server.scrape.universal_html import fetch_html_via_nodriver
 
-        class _FakeProc:
-            returncode = 0
-
-            async def communicate(self):
-                return b"<html><body><p>ok</p></body></html>", b""
-
         with patch.dict(
             "os.environ",
             {"HTTP_PROXY": "http://proxy.invalid:8080"},
@@ -100,7 +116,7 @@ class TestUniversalHtmlLoader(unittest.IsolatedAsyncioTestCase):
             "kindly_web_search_mcp_server.scrape.universal_html.asyncio.create_subprocess_exec",
             new_callable=AsyncMock,
         ) as mock_spawn:
-            mock_spawn.return_value = _FakeProc()
+            mock_spawn.return_value = self._fake_proc(b"<html><body><p>ok</p></body></html>")
             await fetch_html_via_nodriver("https://example.com")
 
         _args, kwargs = mock_spawn.call_args
