@@ -10,6 +10,8 @@ from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from starlette.responses import JSONResponse
+import uvicorn
 
 from .models import GetContentResponse, WebSearchResponse
 from .content.resolver import resolve_page_content_markdown
@@ -113,6 +115,37 @@ def _resolve_host_port(host: str | None, port: int | None) -> tuple[str, int]:
     return resolved_host, resolved_port
 
 
+def _build_streamable_http_app(mount_path: str | None):
+    app = mcp.streamable_http_app()
+    resolved_mount_path = mount_path or "/mcp"
+
+    async def wrapped(scope, receive, send):
+        # LiteLLM and some probes occasionally hit GET /mcp without a session header.
+        # Treat that as a lightweight health/discovery probe instead of logging 400/404 noise.
+        if scope["type"] == "http" and scope["method"] == "GET":
+            path = scope.get("path", "")
+            if path == resolved_mount_path:
+                headers = {
+                    key.decode("latin-1").lower(): value.decode("latin-1")
+                    for key, value in scope.get("headers", [])
+                }
+                if not headers.get("mcp-session-id"):
+                    response = JSONResponse(
+                        {
+                            "status": "ok",
+                            "server": "kindly-web-search",
+                            "transport": "streamable-http",
+                            "requires_session": True,
+                        }
+                    )
+                    await response(scope, receive, send)
+                    return
+
+        await app(scope, receive, send)
+
+    return wrapped
+
+
 def main(argv: list[str] | None = None) -> None:
     """
     Entrypoint for running the MCP server.
@@ -176,6 +209,11 @@ def main(argv: list[str] | None = None) -> None:
             mcp.settings.transport_security = TransportSecuritySettings(
                 enable_dns_rebinding_protection=False
             )
+
+    if transport == "streamable-http":
+        host, port = _resolve_host_port(args.host, args.port)
+        uvicorn.run(_build_streamable_http_app(args.mount_path), host=host, port=port)
+        return
 
     try:
         mcp.run(transport=transport, mount_path=args.mount_path)
