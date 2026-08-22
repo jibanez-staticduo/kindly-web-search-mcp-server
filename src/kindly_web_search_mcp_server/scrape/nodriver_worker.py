@@ -13,10 +13,17 @@ import re
 import shutil
 import signal
 import socket
+import subprocess
 import sys
 import tempfile
 import time
 from typing import TextIO
+
+# The only package import in this module. This worker is otherwise stdlib-only
+# because it runs as a `python -m` subprocess, but `utils.diagnostics` is itself
+# stdlib-only behind empty package `__init__` files, so the import is free. Sharing
+# the redaction keeps one definition of what a credential looks like.
+from ..utils.diagnostics import redact_url_credentials
 
 
 class _NullTextIO(io.TextIOBase):
@@ -352,6 +359,46 @@ def _is_snap_browser(executable_path: str) -> bool:
     return resolved.startswith("/snap/") or "/snap/" in resolved
 
 
+_UA_TEMPLATE = (
+    "Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/{version} Safari/537.36"
+)
+_DEFAULT_CHROME_VERSION = "120.0.0.0"
+
+
+def _detect_chrome_version(executable_path: str | None) -> str:
+    if not executable_path:
+        return _DEFAULT_CHROME_VERSION
+    try:
+        result = subprocess.run(
+            [executable_path, "--version"],
+            capture_output=True, text=True, timeout=5,
+        )
+        output = (result.stdout or "").strip()
+        # Chromium outputs e.g. "Chromium 131.0.6778.204" or "Google Chrome 131.0.6778.204"
+        parts = output.split()
+        for part in reversed(parts):
+            if re.match(r"\d+\.\d+\.\d+\.\d+", part):
+                return part
+    except Exception:
+        pass
+    return _DEFAULT_CHROME_VERSION
+
+
+def _resolve_user_agent(executable_path: str | None) -> str:
+    raw = (os.environ.get("KINDLY_USER_AGENT") or "").strip()
+    if raw:
+        return raw
+    version = _detect_chrome_version(executable_path)
+    if platform.system() == "Windows":
+        pl = "Windows NT 10.0; Win64; x64"
+    elif platform.system() == "Darwin":
+        pl = "Macintosh; Intel Mac OS X 10_15_7"
+    else:
+        pl = "X11; Linux x86_64"
+    return _UA_TEMPLATE.format(platform=pl, version=version)
+
+
 def _resolve_start_retry_attempts() -> int:
     raw = (os.environ.get("KINDLY_NODRIVER_RETRY_ATTEMPTS") or "").strip()
     try:
@@ -473,6 +520,15 @@ def _resolve_snap_backoff_multiplier() -> float:
     return max(1.0, min(value, 20.0))
 
 
+def _resolve_chrome_proxy() -> str:
+    raw = (os.environ.get("KINDLY_CHROME_PROXY") or "").strip()
+    return raw
+
+
+def _resolve_chrome_proxy_bypass() -> str:
+    return (os.environ.get("KINDLY_CHROME_PROXY_BYPASS") or "").strip()
+
+
 def _build_chromium_launch_args(
     *,
     base_browser_args: list[str],
@@ -492,11 +548,19 @@ def _build_chromium_launch_args(
         "--window-size=1920,1080",
         "--disable-dev-shm-usage",
         "--disable-blink-features=AutomationControlled",
+        "--disable-features=AutomationControlled",
         "--disable-logging",
         "--log-level=3",
         f"--user-agent={user_agent}",
         *([] if sandbox_enabled else ["--no-sandbox"]),
     ]
+
+    proxy = _resolve_chrome_proxy()
+    if proxy:
+        args.append(f"--proxy-server={proxy}")
+    bypass = _resolve_chrome_proxy_bypass()
+    if bypass:
+        args.append(f"--proxy-bypass-list={bypass}")
 
     # Append the base args last to preserve existing behavior (and allow overrides),
     # while avoiding duplicates that can confuse Chromium.
@@ -674,16 +738,19 @@ async def _fetch_html(
                 "reuse_browser": False,
             },
         )
+        # Resolve user agent dynamically from browser version
+        resolved_user_agent = _resolve_user_agent(resolved_browser_executable_path)
         base_browser_args = [
             "--window-size=1920,1080",
             *([] if sandbox_enabled else ["--no-sandbox"]),
             "--disable-dev-shm-usage",
             "--disable-blink-features=AutomationControlled",
+            "--disable-features=AutomationControlled",
             "--disable-logging",
             "--log-level=3",
             "--disable-background-timer-throttling",
             "--disable-renderer-backgrounding",
-            f"--user-agent={user_agent}",
+            f"--user-agent={resolved_user_agent}",
         ]
         _emit_diag(
             "worker.browser_args",
@@ -988,7 +1055,10 @@ async def _fetch_html(
                         {
                             "attempt": attempt + 1,
                             "user_data_dir": resolved_user_data_dir,
-                            "args": chromium_args,
+                            # `--proxy-server` carries KINDLY_CHROME_PROXY verbatim, which
+                            # may embed credentials. Redact the emitted copy only; Chromium
+                            # still receives the real `chromium_args` below.
+                            "args": [redact_url_credentials(arg) for arg in chromium_args],
                         },
                     )
                     chrome_proc = await _launch_chromium(resolved_browser_executable_path, chromium_args)
