@@ -4,21 +4,24 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import sys
 import time
 from typing import Literal
 
+import uvicorn
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from starlette.middleware.cors import CORSMiddleware
+from starlette.requests import Request
 from starlette.responses import JSONResponse
-import uvicorn
 
-from .models import GetContentResponse, WebSearchResponse
 from .content.resolver import resolve_page_content_markdown
+from .models import GetContentResponse, WebSearchResponse
 from .search import any_provider_configured, provider_env_vars, search_web
 from .utils.diagnostics import (
-    Diagnostics,
     MAX_SAMPLE_CHARS,
+    Diagnostics,
     diagnostics_enabled,
     mask_env_values,
     new_request_id,
@@ -29,15 +32,98 @@ from .utils.logging import configure_logging
 configure_logging()
 LOGGER = logging.getLogger(__name__)
 
+# Mirrors the loopback allowlist FastMCP installs for itself when it is handed no
+# `transport_security`. It is repeated here rather than left to the SDK because the SDK
+# applies it only when the *constructor* `host` is a loopback address, while this server
+# resolves its bind address later from `FASTMCP_HOST`/`--host`. Stating it explicitly
+# keeps the protection identical whatever we end up binding to.
+LOCALHOST_ALLOWED_HOSTS = ("127.0.0.1:*", "localhost:*", "[::1]:*")
+LOCALHOST_ALLOWED_ORIGINS = ("http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*")
+
+
+def _split_env_list(raw: str | None) -> list[str]:
+    """Split a comma-separated environment variable into its entries.
+
+    Args:
+        raw: The raw environment value, or ``None`` when the variable is unset.
+
+    Returns:
+        The non-empty, whitespace-trimmed entries, in declaration order.
+    """
+    return [item.strip() for item in (raw or "").split(",") if item.strip()]
+
+
+def _resolve_transport_security(
+    allowed_hosts: list[str],
+    allowed_origins: list[str],
+) -> tuple[TransportSecuritySettings, list[str]]:
+    """Resolve DNS-rebinding settings and the CORS origins that must match them.
+
+    DNS rebinding protection stays on unconditionally, and an unset allowlist falls back
+    to loopback rather than to "allow everything". The difference matters because this
+    server is unauthenticated and ``get_content`` fetches whatever URL the caller names:
+    an empty allowlist combined with a permissive CORS policy lets any web page the
+    operator visits drive the server against their own LAN and read the response.
+
+    The two lists default independently. Setting only ``FASTMCP_ALLOWED_HOSTS`` — the
+    natural reaction to a ``421 Invalid Host header`` behind Docker Compose — therefore
+    keeps loopback origins working instead of rejecting every browser request with
+    ``403 Invalid Origin header``.
+
+    Args:
+        allowed_hosts: Host patterns from ``FASTMCP_ALLOWED_HOSTS``; empty when unset.
+        allowed_origins: Origin patterns from ``FASTMCP_ALLOWED_ORIGINS``; empty when unset.
+
+    Returns:
+        A tuple of the :class:`~mcp.server.transport_security.TransportSecuritySettings`
+        for :class:`~mcp.server.fastmcp.FastMCP` and the origin list the CORS middleware
+        must advertise. The second element is always the settings' own origin list, so
+        the two surfaces cannot disagree.
+    """
+    hosts = allowed_hosts or list(LOCALHOST_ALLOWED_HOSTS)
+    origins = allowed_origins or list(LOCALHOST_ALLOWED_ORIGINS)
+    settings = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=hosts,
+        allowed_origins=origins,
+    )
+    return settings, origins
+
+
+def _cors_origin_regex(origins: list[str]) -> str:
+    """Translate transport-security origin patterns into a CORS origin regex.
+
+    Starlette's ``CORSMiddleware`` matches origins by exact string, so the SDK's
+    ``host:*`` port wildcard would quietly match nothing if passed to it verbatim.
+    Compiling both surfaces from one list is what stops CORS from approving a preflight
+    for an origin the transport-security middleware then rejects with a 403.
+
+    Args:
+        origins: Origin patterns, each either an exact origin or one ending in ``:*``.
+
+    Returns:
+        A regular expression matching exactly the supplied patterns.
+    """
+    alternatives = [
+        re.escape(origin[:-1]) + r"\d+" if origin.endswith(":*") else re.escape(origin)
+        for origin in origins
+    ]
+    return "|".join(alternatives)
+
+
+ALLOWED_HOSTS = _split_env_list(os.getenv("FASTMCP_ALLOWED_HOSTS"))
+ALLOWED_ORIGINS = _split_env_list(os.getenv("FASTMCP_ALLOWED_ORIGINS"))
+TRANSPORT_SECURITY, CORS_ALLOW_ORIGINS = _resolve_transport_security(
+    ALLOWED_HOSTS, ALLOWED_ORIGINS
+)
+
 mcp = FastMCP(
     "kindly-web-search",
     instructions=(
         "Web search via Serper (default), Tavily, or a self-hosted SearXNG instance with best-effort "
         "scraping/extraction of result pages into Markdown for LLM consumption."
     ),
-    # LiteLLM reaches this server over the Docker network, so localhost-only DNS
-    # rebinding protection blocks tool discovery and prevents wrapper generation.
-    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    transport_security=TRANSPORT_SECURITY,
 )
 
 Transport = Literal["stdio", "sse", "streamable-http"]
@@ -52,8 +138,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     transport_group = parser.add_mutually_exclusive_group()
     transport_group.add_argument(
         "--transport",
-        choices=("stdio", "sse", "streamable-http"),
-        help="Transport to use (default: stdio).",
+        choices=("stdio", "sse", "streamable-http", "http"),
+        help="Transport to use (default: stdio). `http` is an alias for `streamable-http`.",
     )
     transport_group.add_argument(
         "--stdio",
@@ -98,8 +184,31 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _resolve_transport(raw: str | None) -> Transport:
-    if raw in ("stdio", "sse", "streamable-http"):
-        return raw
+    """Resolve the transport from the CLI flag, then ``FASTMCP_TRANSPORT``.
+
+    The CLI flag wins, so an explicit invocation is never overridden by ambient
+    environment. An unrecognised value logs a warning before falling back: in a Compose
+    file a typo would otherwise bring the container up in stdio, which exits immediately
+    with nothing to explain why.
+
+    Args:
+        raw: The value of the CLI transport flag, or ``None`` when it was not given.
+
+    Returns:
+        The resolved transport, with ``http`` normalised to ``streamable-http``.
+    """
+    resolved_transport = (raw or os.environ.get("FASTMCP_TRANSPORT") or "").strip()
+    if not resolved_transport:
+        return "stdio"
+    if resolved_transport == "http":
+        return "streamable-http"
+    if resolved_transport in ("stdio", "sse", "streamable-http"):
+        return resolved_transport
+    LOGGER.warning(
+        "Unrecognised transport %r; falling back to stdio. "
+        "Valid values: stdio, sse, streamable-http (or http).",
+        resolved_transport,
+    )
     return "stdio"
 
 
@@ -115,21 +224,31 @@ def _resolve_host_port(host: str | None, port: int | None) -> tuple[str, int]:
     return resolved_host, resolved_port
 
 
-def _build_streamable_http_app(mount_path: str | None):
+def _build_streamable_http_app():
     app = mcp.streamable_http_app()
-    resolved_mount_path = mount_path or "/mcp"
 
     async def wrapped(scope, receive, send):
         # LiteLLM and some probes occasionally hit GET /mcp without a session header.
         # Treat that as a lightweight health/discovery probe instead of logging 400/404 noise.
         if scope["type"] == "http" and scope["method"] == "GET":
             path = scope.get("path", "")
-            if path == resolved_mount_path:
+            if path == "/mcp":
                 headers = {
                     key.decode("latin-1").lower(): value.decode("latin-1")
                     for key, value in scope.get("headers", [])
                 }
                 if not headers.get("mcp-session-id"):
+                    # Keep this import request-local: upstream tests intentionally replace
+                    # the SDK module with a settings-only fake while importing this module.
+                    from mcp.server.transport_security import (
+                        TransportSecurityMiddleware,
+                    )
+
+                    security = TransportSecurityMiddleware(TRANSPORT_SECURITY)
+                    rejection = await security.validate_request(Request(scope, receive))
+                    if rejection is not None:
+                        await rejection(scope, receive, send)
+                        return
                     response = JSONResponse(
                         {
                             "status": "ok",
@@ -143,6 +262,8 @@ def _build_streamable_http_app(mount_path: str | None):
 
         await app(scope, receive, send)
 
+    # Preserve route introspection through the lightweight ASGI wrapper.
+    wrapped.routes = app.routes
     return wrapped
 
 
@@ -215,25 +336,28 @@ def main(argv: list[str] | None = None) -> None:
         for key, value in (("host", host), ("port", port)):
             if hasattr(mcp, "settings") and hasattr(mcp.settings, key):
                 setattr(mcp.settings, key, value)
-        # FastMCP auto-enables localhost-only host validation because the server
-        # object is created before CLI args are parsed. In Docker we bind to
-        # 0.0.0.0 and LiteLLM connects via the container hostname, so we must
-        # disable the stale localhost-only restriction after resolving runtime
-        # host/port.
-        if hasattr(mcp, "settings") and hasattr(mcp.settings, "transport_security"):
-            mcp.settings.transport_security = TransportSecuritySettings(
-                enable_dns_rebinding_protection=False
-            )
 
-    if transport == "streamable-http":
-        host, port = _resolve_host_port(args.host, args.port)
-        uvicorn.run(_build_streamable_http_app(args.mount_path), host=host, port=port)
-        return
+        # Branch on the resolved transport, not on `hasattr`: `streamable_http_app`
+        # exists on every supported SDK version, so probing for it always selected
+        # Streamable HTTP, making `--sse` serve /mcp while /sse returned 404. Passing
+        # `args.mount_path` here is also what keeps `--mount-path` from being a no-op.
+        asgi_app = (
+            mcp.sse_app(args.mount_path)
+            if transport == "sse"
+            else _build_streamable_http_app()
+        )
 
-    try:
-        mcp.run(transport=transport, mount_path=args.mount_path)
-    except TypeError:
-        # Backward-compat: older MCP SDKs may not accept `mount_path`.
+        # NB: allow_credentials=True will require explicit methods & headers
+        app = CORSMiddleware(
+            asgi_app,
+            allow_origin_regex=_cors_origin_regex(CORS_ALLOW_ORIGINS),
+            allow_credentials=False,
+            allow_methods=["*"],
+            allow_headers=["*"],
+            expose_headers=["mcp-session-id", "mcp-protocol-version"],
+        )
+        uvicorn.run(app, host=host, port=port)
+    else:
         mcp.run(transport=transport)
 
 
@@ -319,7 +443,7 @@ async def web_search(
     Prerequisites:
     - Requires at least one configured search provider in the server environment:
       `SERPER_API_KEY` (Serper), `SERPBASE_API_KEY` (SerpBase), `TAVILY_API_KEY` (Tavily),
-      `SEARXNG_BASE_URL` (SearXNG), or `SOFYA_API_KEY` (Sofya).
+      `SEARXNG_BASE_URL` (SearXNG), `SOFYA_API_KEY` (Sofya), or `YDC_API_KEY` (You.com).
       If none is set, this tool will fail.
 
     Returns:
@@ -329,7 +453,7 @@ async def web_search(
 
     Notes:
     - Content extraction is best-effort and may be truncated to avoid context “bombs”.
-    - Provider routing (strict order): Serper → SerpBase → Tavily → SearXNG → Sofya.
+    - Provider routing (strict order): Serper → SerpBase → Tavily → SearXNG → Sofya → You.com.
       No cross-provider fallback.
     - If the search provider fails (missing key, quota/rate-limit, network issues), the tool will error.
     - For a deeper look at one result, call `get_content()` on the chosen `link`.

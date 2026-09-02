@@ -13,3 +13,12 @@ __pycache__/
 /REQUIREMENTS.md
 /.claude/
 /research/
+
+# Coverage artefacts. Shipping `.coveragerc` is what makes a local `coverage run`
+# the expected thing to do, so these start appearing now. `.coverage.*` covers the
+# suffixed data files `parallel = true` produces under `.coveragerc-subprocess`.
+/.coverage
+/.coverage.*
+/coverage.json
+/coverage.xml
+/htmlcov/
