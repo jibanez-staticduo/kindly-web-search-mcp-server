@@ -853,15 +853,16 @@ Container will be built at the first run. To rebuild it, append `--build` to the
   - Env vars:
     - `KINDLY_TOOL_TOTAL_TIMEOUT_SECONDS`: total time budget per `web_search` / `get_content` call (search + extraction). Default: `120`.
     - `KINDLY_TOOL_TOTAL_TIMEOUT_MAX_SECONDS`: caps the above value (safety). Default: `600`.
-    - `KINDLY_WEB_SEARCH_MAX_CONCURRENCY`: max parallel content fetches. Default: `3` (when unset or invalid).
+    - `KINDLY_WEB_SEARCH_MAX_CONCURRENCY`: max parallel content fetches. Default: `3` (when unset or invalid), clamped to `1..10`.
   - Recommended starting point (PowerShell):
     - `$env:KINDLY_TOOL_TOTAL_TIMEOUT_SECONDS="180"`
     - `$env:KINDLY_TOOL_TOTAL_TIMEOUT_MAX_SECONDS="600"`
     - Optional (reduces parallel browser work): `$env:KINDLY_WEB_SEARCH_MAX_CONCURRENCY="1"`
 - Browser reuse is on by default for universal HTML loading. Note: pooled Chromium shares state across requests (cookies, local storage, cache, and user-agent from the first request handled by each slot).
   - `KINDLY_NODRIVER_REUSE_BROWSER=0` disables reuse (fresh Chromium per request).
-  - `KINDLY_NODRIVER_BROWSER_POOL_SIZE=2` controls how many Chromium instances are kept warm.
-  - `KINDLY_NODRIVER_ACQUIRE_TIMEOUT_SECONDS=30` controls how long to wait for a pooled slot before falling back to per-request Chromium.
+    - `KINDLY_NODRIVER_BROWSER_POOL_SIZE=10` controls the maximum number of Chromium instances kept warm.
+    - `KINDLY_NODRIVER_IDLE_TTL_SECONDS=1800` closes a pooled Chromium slot after 30 minutes without use; the next request starts it again. Set `0` to keep pooled browsers alive indefinitely.
+    - `KINDLY_NODRIVER_ACQUIRE_TIMEOUT_SECONDS=30` controls how long to wait for a pooled slot before falling back to per-request Chromium.
   - Optional: `KINDLY_NODRIVER_PORT_RANGE=45000-45100` restricts remote debugging ports.
   - Pooled slots are health-checked before use and auto-restarted if the DevTools endpoint is stale (diagnostics emit `pool.slot_probe` and `pool.slot_restart`).
   - If pool acquisition times out or fails, the server falls back to per-request Chromium and emits a `pool.acquire_timeout`/`pool.slot_error` diagnostic when diagnostics are enabled.

@@ -171,6 +171,13 @@ class TestWebSearchTool(unittest.IsolatedAsyncioTestCase):
 
         with patch.dict(
             os.environ,
+            {"KINDLY_WEB_SEARCH_MAX_CONCURRENCY": "50"},
+            clear=True,
+        ), patch("kindly_web_search_mcp_server.server.os.name", "posix"):
+            self.assertEqual(_resolve_web_search_max_concurrency(20), 10)
+
+        with patch.dict(
+            os.environ,
             {"KINDLY_WEB_SEARCH_MAX_CONCURRENCY": "abc"},
             clear=True,
         ), patch("kindly_web_search_mcp_server.server.os.name", "posix"):

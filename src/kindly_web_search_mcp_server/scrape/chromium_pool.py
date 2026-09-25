@@ -16,6 +16,7 @@ from . import nodriver_worker as worker
 
 DEFAULT_POOL_SIZE = 1
 DEFAULT_ACQUIRE_TIMEOUT_SECONDS = 30.0
+DEFAULT_IDLE_TTL_SECONDS = 1800.0
 POOL_HEALTH_TIMEOUT_SECONDS = 2.0
 
 
@@ -46,6 +47,17 @@ def _resolve_acquire_timeout_seconds() -> float:
     if value <= 0:
         value = DEFAULT_ACQUIRE_TIMEOUT_SECONDS
     return max(0.5, min(value, 300.0))
+
+
+def _resolve_idle_ttl_seconds() -> float:
+    raw = (os.environ.get("KINDLY_NODRIVER_IDLE_TTL_SECONDS") or "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        value = DEFAULT_IDLE_TTL_SECONDS
+    if value <= 0:
+        return 0.0
+    return min(value, 86_400.0)
 
 
 def _parse_port_range(raw: str) -> tuple[int, int] | None:
@@ -126,6 +138,50 @@ class ChromiumSlot:
     user_data_dir: tempfile.TemporaryDirectory[str] | None = None
     browser_executable_path: str | None = None
     last_started: float | None = None
+    idle_ttl_seconds: float = DEFAULT_IDLE_TTL_SECONDS
+    in_use: bool = False
+    idle_generation: int = 0
+    idle_task: asyncio.Task[None] | None = None
+    expiring: bool = False
+
+    def _cancel_idle_expiry(self) -> None:
+        task = self.idle_task
+        self.idle_task = None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
+    async def mark_acquired(self) -> None:
+        self.in_use = True
+        self.idle_generation += 1
+        task = self.idle_task
+        if task is not None:
+            if not self.expiring:
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            self.idle_task = None
+
+    def mark_released(self) -> None:
+        self.in_use = False
+        self.idle_generation += 1
+        self._cancel_idle_expiry()
+        if self.idle_ttl_seconds > 0 and self.proc is not None:
+            generation = self.idle_generation
+            self.idle_task = asyncio.create_task(self._expire_when_idle(generation))
+
+    async def _expire_when_idle(self, generation: int) -> None:
+        try:
+            await asyncio.sleep(self.idle_ttl_seconds)
+            if generation != self.idle_generation or self.in_use:
+                return
+            self.expiring = True
+            await self.terminate()
+        except asyncio.CancelledError:
+            return
+        finally:
+            self.expiring = False
+            if self.idle_task is asyncio.current_task():
+                self.idle_task = None
 
     async def ensure_started(
         self,
@@ -232,6 +288,7 @@ class ChromiumSlot:
             )
 
     async def terminate(self) -> None:
+        self._cancel_idle_expiry()
         if self.proc is not None:
             await worker._terminate_process(self.proc)
             self.proc = None
@@ -240,6 +297,7 @@ class ChromiumSlot:
             self.user_data_dir = None
 
     def terminate_sync(self) -> None:
+        self._cancel_idle_expiry()
         proc = self.proc
         if proc is None:
             return
@@ -263,12 +321,13 @@ class ChromiumPool:
     size: int
     acquire_timeout_seconds: float
     port_range: tuple[int, int] | None
+    idle_ttl_seconds: float = DEFAULT_IDLE_TTL_SECONDS
     slots: list[ChromiumSlot] = field(default_factory=list)
     queue: asyncio.Queue[ChromiumSlot] = field(default_factory=asyncio.Queue)
 
     def __post_init__(self) -> None:
         for idx in range(self.size):
-            slot = ChromiumSlot(slot_id=idx)
+            slot = ChromiumSlot(slot_id=idx, idle_ttl_seconds=self.idle_ttl_seconds)
             self.slots.append(slot)
             self.queue.put_nowait(slot)
 
@@ -287,6 +346,8 @@ class ChromiumPool:
                     {"timeout_seconds": self.acquire_timeout_seconds},
                 )
             return None
+
+        await slot.mark_acquired()
 
         try:
             await slot.ensure_started(
@@ -319,6 +380,7 @@ class ChromiumPool:
                 "Released pooled Chromium slot",
                 {"slot_id": slot.slot_id, "host": slot.host, "port": slot.port},
             )
+        slot.mark_released()
         await self.queue.put(slot)
 
     async def shutdown(self) -> None:
@@ -345,12 +407,17 @@ async def get_chromium_pool(diagnostics: Diagnostics | None = None) -> ChromiumP
                 size=_resolve_pool_size(),
                 acquire_timeout_seconds=_resolve_acquire_timeout_seconds(),
                 port_range=_resolve_port_range(),
+                idle_ttl_seconds=_resolve_idle_ttl_seconds(),
             )
             if diagnostics:
                 diagnostics.emit(
                     "pool.init",
                     "Initialized Chromium pool",
-                    {"size": _POOL.size, "port_range": _POOL.port_range},
+                    {
+                        "size": _POOL.size,
+                        "port_range": _POOL.port_range,
+                        "idle_ttl_seconds": _POOL.idle_ttl_seconds,
+                    },
                 )
             _register_shutdown(_POOL)
     return _POOL
